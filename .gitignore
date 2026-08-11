@@ -223,3 +223,7 @@ datasets
 runs
 outputs
 real-scenario
+
+
+.DS_Store
+.idea
