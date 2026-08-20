@@ -55,6 +55,17 @@ python scripts/view_antiuav_boxes.py \
   --delay 30
 ```
 
+Browse the extracted frames in `gem_dataset`:
+
+```bash
+python scripts/view_gem_frames.py
+```
+
+Use Left/Right to move between frames, Up/Down to move between sequence
+folders, and Q or Esc to close the OpenCV window. The viewer also accepts
+A/D and W/S as fallback controls. To browse a different copy of the dataset,
+pass its path with `--root`.
+
 ## Convert To YOLO
 
 The raw `Anti-UAV-RGBT` directory is only read by the converter. The generated
@@ -150,29 +161,63 @@ datasets/.../conversion_stats.json
 
 ## Train
 
+All training runs are saved as `runs/DD_MM_YYYY_HH_MM_SS_<experiment>`:
+
+```bash
+python scripts/train_drone_model.py \
+  --experiment yolo11n_drone_merged \
+  --model yolo11n.pt \
+  --data datasets/drone_merged/dataset.yaml \
+  --epochs 60 \
+  --imgsz 640 \
+  --batch 32 \
+  --device mps
+```
+
+All annotated videos and inference metadata are saved as
+`artifacts/DD_MM_YYYY_HH_MM_SS_<experiment>`:
+
+```bash
+python scripts/predict_videos_with_progress.py \
+  --experiment yolo11n_drone_merged_real_scenario \
+  --model runs/<training-run>/weights/best.pt \
+  --source real-scenario \
+  --device mps
+```
+
+For a legacy job that was started before this layout was introduced, wait for
+its process to exit and then move it without hand-building the directory name:
+
+```bash
+python scripts/finalize_experiment.py training runs/old_name --experiment old_name
+python scripts/finalize_experiment.py artifact path/to/predictions --experiment old_predictions
+```
+
 Smoke train from config:
 
 ```bash
-yolo detect train \
-  model=yolo11n.yaml \
-  data=outputs/antiuav_yolo_smoke/dataset.yaml \
-  epochs=1 \
-  imgsz=320 \
-  batch=2 \
-  workers=0
+python scripts/train_drone_model.py \
+  --experiment antiuav_smoke \
+  --model yolo11n.yaml \
+  --data outputs/antiuav_yolo_smoke/dataset.yaml \
+  --epochs 1 \
+  --imgsz 320 \
+  --batch 2 \
+  --workers 0
 ```
 
 First real run:
 
 ```bash
-yolo detect train \
-  model=yolo11n.pt \
-  data=datasets/antiuav_yolo_visible_s10/dataset.yaml \
-  epochs=50 \
-  imgsz=640 \
-  batch=8 \
-  workers=0 \
-  device=mps
+python scripts/train_drone_model.py \
+  --experiment antiuav_visible_s10 \
+  --model yolo11n.pt \
+  --data datasets/antiuav_yolo_visible_s10/dataset.yaml \
+  --epochs 50 \
+  --imgsz 640 \
+  --batch 8 \
+  --workers 0 \
+  --device mps
 ```
 
 If Ultralytics falls back to CPU, remove `device=mps` and reduce `batch`.

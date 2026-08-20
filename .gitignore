@@ -219,10 +219,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-datasets
-runs
-outputs
-real-scenario
+datasets/
+runs/
+outputs/
+artifacts/
+real-scenario/
 
 
 .DS_Store
