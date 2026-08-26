@@ -33,6 +33,9 @@ FORMAT_EXTENSIONS = {
 }
 SPLITS = ("train", "val", "test")
 SOURCE_PRIORITY = {
+    "gem_new": 115,
+    "gem": 110,
+    "midgard": 105,
     "antiuav": 100,
     "pathik": 90,
     "kaggle1_xml": 85,
@@ -51,6 +54,7 @@ class Candidate:
     source_split: str | None
     boxes: list[tuple[float, float, float, float]]
     image_hash: str
+    visual_hash: str
     image_format: str
     width: int
     height: int
@@ -70,6 +74,7 @@ class Audit:
     removed_objects: Counter[str] = field(default_factory=Counter)
     repaired_boxes: Counter[str] = field(default_factory=Counter)
     duplicates: Counter[str] = field(default_factory=Counter)
+    near_duplicates: Counter[str] = field(default_factory=Counter)
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,13 +87,19 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Keep every Nth already-extracted Anti-UAV frame.",
     )
-    parser.add_argument(
-        "--kaggle2-negative-fraction",
-        type=float,
-        default=0.30,
-        help="Maximum fraction of Kaggle 2 images that may be drone-free.",
-    )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--near-duplicate-distance",
+        type=int,
+        default=10,
+        help="Maximum 512-bit difference-hash distance to report across sources.",
+    )
+    parser.add_argument(
+        "--min-box-pixels",
+        type=float,
+        default=8.0,
+        help="Drop an image if any drone box is narrower or shorter than this many pixels.",
+    )
     return parser.parse_args()
 
 
@@ -107,10 +118,31 @@ def inspect_image(data: bytes) -> tuple[str, int, int]:
     return image_format, width, height
 
 
-def image_info(path: Path) -> tuple[str, str, int, int]:
+def difference_hash(data: bytes) -> str:
+    """Return a 512-bit perceptual hash resilient to encoding and size changes."""
+    with Image.open(io.BytesIO(data)) as image:
+        grayscale = ImageOps.exif_transpose(image).convert("L")
+        horizontal = grayscale.resize((17, 16), Image.Resampling.LANCZOS)
+        vertical = grayscale.resize((16, 17), Image.Resampling.LANCZOS)
+    horizontal_pixels = list(horizontal.getdata())
+    vertical_pixels = list(vertical.getdata())
+    bits = 0
+    for y in range(16):
+        row = y * 17
+        for x in range(16):
+            bits = (bits << 1) | (horizontal_pixels[row + x] > horizontal_pixels[row + x + 1])
+    for y in range(16):
+        row = y * 16
+        next_row = (y + 1) * 16
+        for x in range(16):
+            bits = (bits << 1) | (vertical_pixels[row + x] > vertical_pixels[next_row + x])
+    return f"{bits:0128x}"
+
+
+def image_info(path: Path) -> tuple[str, str, int, int, str]:
     data = path.read_bytes()
     image_format, width, height = inspect_image(data)
-    return hashlib.sha256(data).hexdigest(), image_format, width, height
+    return hashlib.sha256(data).hexdigest(), image_format, width, height, difference_hash(data)
 
 
 def clip_yolo_box(
@@ -178,7 +210,7 @@ def add_local_candidate(
         audit.skipped[f"{source}:missing_label"] += 1
         return
     try:
-        image_hash, image_format, width, height = image_info(image_path)
+        image_hash, image_format, width, height, visual_hash = image_info(image_path)
         boxes, removed, repaired, malformed = parse_yolo_label(
             label_path, width, height, keep_class, class_names
         )
@@ -197,6 +229,7 @@ def add_local_candidate(
             source_split=source_split,
             boxes=boxes,
             image_hash=image_hash,
+            visual_hash=visual_hash,
             image_format=image_format,
             width=width,
             height=height,
@@ -243,7 +276,7 @@ def ingest_kaggle1_xml(root: Path, candidates: list[Candidate], audit: Audit) ->
             if image_path is None:
                 audit.skipped["kaggle1_xml:missing_image"] += 1
                 continue
-            image_hash, image_format, width, height = image_info(image_path)
+            image_hash, image_format, width, height, visual_hash = image_info(image_path)
             boxes = []
             for obj in xml_root.findall("object"):
                 name = (obj.findtext("name") or "").strip().lower()
@@ -271,6 +304,7 @@ def ingest_kaggle1_xml(root: Path, candidates: list[Candidate], audit: Audit) ->
                     source_split=None,
                     boxes=boxes,
                     image_hash=image_hash,
+                    visual_hash=visual_hash,
                     image_format=image_format,
                     width=width,
                     height=height,
@@ -345,6 +379,180 @@ def ingest_rigoleto(root: Path, candidates: list[Candidate], audit: Audit) -> No
             )
 
 
+def ingest_midgard(root: Path, candidates: list[Candidate], audit: Audit) -> None:
+    base = root / "MIDGARD"
+    image_dirs = sorted(path for path in base.glob("*/*/images") if path.is_dir())
+    for image_dir in image_dirs:
+        scene = image_dir.parent
+        annotation_dir = scene / "annotation"
+        images = sorted(path for path in image_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS)
+        for image_path in tqdm(images, desc=f"MIDGARD {scene.name}", unit="image"):
+            annotation_path = annotation_dir / f"annot_{image_path.stem.removeprefix('image_')}.csv"
+            if not annotation_path.is_file():
+                audit.skipped["midgard:missing_label"] += 1
+                continue
+            try:
+                image_hash, image_format, width, height, visual_hash = image_info(image_path)
+                boxes = []
+                with annotation_path.open(encoding="utf-8", newline="") as handle:
+                    for row in csv.reader(handle):
+                        if len(row) < 5:
+                            audit.skipped["midgard:malformed_boxes"] += 1
+                            continue
+                        x, y, box_width, box_height = map(float, row[1:5])
+                        if not any((x, y, box_width, box_height)):
+                            continue
+                        raw = (
+                            (x + box_width / 2) / width,
+                            (y + box_height / 2) / height,
+                            box_width / width,
+                            box_height / height,
+                        )
+                        box, repaired = clip_yolo_box(raw, width, height)
+                        audit.repaired_boxes["midgard"] += int(repaired)
+                        if box is None:
+                            audit.skipped["midgard:malformed_boxes"] += 1
+                        else:
+                            boxes.append(box)
+                candidates.append(
+                    Candidate(
+                        source="midgard",
+                        original=str(image_path),
+                        group=f"midgard:{scene.relative_to(base)}",
+                        source_split=None,
+                        boxes=boxes,
+                        image_hash=image_hash,
+                        visual_hash=visual_hash,
+                        image_format=image_format,
+                        width=width,
+                        height=height,
+                        image_path=image_path,
+                        negative_kind="native_empty" if not boxes else "",
+                    )
+                )
+                audit.candidates["midgard"] += 1
+            except (OSError, UnidentifiedImageError, ValueError):
+                audit.skipped["midgard:invalid_record"] += 1
+
+
+def interpolate_gem_track(sequence: list[dict[str, object]]) -> dict[int, tuple[float, float, float, float]]:
+    """Interpolate Label Studio video boxes, retaining enabled frame intervals."""
+    points = sorted(sequence, key=lambda point: int(point["frame"]))
+    interpolated: dict[int, tuple[float, float, float, float]] = {}
+    for left, right in zip(points, points[1:]):
+        start, end = int(left["frame"]), int(right["frame"])
+        if not bool(left.get("enabled")) or end <= start:
+            continue
+        left_box = tuple(float(left[key]) for key in ("x", "y", "width", "height"))
+        right_box = tuple(float(right[key]) for key in ("x", "y", "width", "height"))
+        final_frame = end if bool(right.get("enabled")) else end - 1
+        for frame in range(start, final_frame + 1):
+            ratio = (frame - start) / (end - start)
+            interpolated[frame] = tuple(
+                first + ratio * (second - first) for first, second in zip(left_box, right_box)
+            )
+    if points and bool(points[-1].get("enabled")):
+        point = points[-1]
+        interpolated[int(point["frame"])] = tuple(
+            float(point[key]) for key in ("x", "y", "width", "height")
+        )
+    return interpolated
+
+
+def ingest_gem(root: Path, candidates: list[Candidate], audit: Audit) -> None:
+    base = root / "gem_dataset"
+    for sequence_dir in sorted(path for path in base.iterdir() if path.is_dir()):
+        csv_files = list(sequence_dir.glob("*.csv"))
+        json_files = list(sequence_dir.glob("*.json"))
+        frames_dir = sequence_dir / "frames"
+        if not csv_files or not json_files or not frames_dir.is_dir():
+            audit.skipped["gem:unannotated_sequence"] += 1
+            continue
+        with json_files[0].open(encoding="utf-8") as handle:
+            tasks = json.load(handle)
+        results = tasks[0].get("annotations", [{}])[0].get("result", []) if tasks else []
+        tracks = [
+            interpolate_gem_track(result["value"].get("sequence", []))
+            for result in results
+            if result.get("type") == "videorectangle"
+            and "Drone" in result.get("value", {}).get("labels", [])
+        ]
+        presence: dict[int, bool] = {}
+        with csv_files[0].open(encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                presence[int(row["frame"])] = bool(int(row["drone_exist"]))
+        frame_paths = sorted(
+            path for path in frames_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        for image_path in tqdm(frame_paths, desc=f"GEM {sequence_dir.name}", unit="image"):
+            match = re.match(r"frame_(\d+)_", image_path.name)
+            if not match:
+                audit.skipped["gem:invalid_frame_name"] += 1
+                continue
+            frame = int(match.group(1))
+            try:
+                image_hash, image_format, width, height, visual_hash = image_info(image_path)
+                boxes = []
+                if presence.get(frame, False):
+                    # Label Studio video frames are one-based; extracted filenames are zero-based.
+                    for track in tracks:
+                        percent_box = track.get(frame + 1)
+                        if percent_box is None:
+                            continue
+                        x, y, box_width, box_height = percent_box
+                        raw = ((x + box_width / 2) / 100, (y + box_height / 2) / 100,
+                               box_width / 100, box_height / 100)
+                        box, repaired = clip_yolo_box(raw, width, height)
+                        audit.repaired_boxes["gem"] += int(repaired)
+                        if box is not None:
+                            boxes.append(box)
+                if presence.get(frame, False) and not boxes:
+                    audit.skipped["gem:positive_without_box"] += 1
+                    continue
+                candidates.append(
+                    Candidate(
+                        source="gem",
+                        original=str(image_path),
+                        group=f"gem:{sequence_dir.name}",
+                        source_split=None,
+                        boxes=boxes,
+                        image_hash=image_hash,
+                        visual_hash=visual_hash,
+                        image_format=image_format,
+                        width=width,
+                        height=height,
+                        image_path=image_path,
+                        negative_kind="native_empty" if not boxes else "",
+                    )
+                )
+                audit.candidates["gem"] += 1
+            except (OSError, UnidentifiedImageError, ValueError):
+                audit.skipped["gem:invalid_record"] += 1
+
+
+def ingest_gem_new(root: Path, candidates: list[Candidate], audit: Audit) -> None:
+    """Ingest the YOLO frames prepared from the new GEM videos."""
+    base = root / "gem_new_videos" / "yolo"
+    images_dir, labels_dir = base / "images", base / "labels"
+    if not images_dir.is_dir() or not labels_dir.is_dir():
+        audit.skipped["gem_new:missing_prepared_dataset"] += 1
+        return
+    images = sorted(
+        path for path in images_dir.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    for image_path in tqdm(images, desc="GEM new", unit="image"):
+        relative = image_path.relative_to(images_dir)
+        add_local_candidate(
+            candidates,
+            audit,
+            source="gem_new",
+            image_path=image_path,
+            label_path=(labels_dir / relative).with_suffix(".txt"),
+            group=f"gem_new:{relative.parent}",
+            source_split=None,
+        )
+
+
 def ingest_pathik(root: Path, candidates: list[Candidate], audit: Audit) -> None:
     base = root / "pathikg-drone-detection-dataset" / "data"
     files = sorted(base.glob("*.parquet"))
@@ -381,6 +589,7 @@ def ingest_pathik(root: Path, candidates: list[Candidate], audit: Audit) -> None
                         else:
                             audit.skipped["pathik:malformed_boxes"] += 1
                     image_hash = hashlib.sha256(data).hexdigest()
+                    visual_hash = difference_hash(data)
                     original_name = record["image"].get("path") or f"image_{record['image_id']}"
                     candidates.append(
                         Candidate(
@@ -390,6 +599,7 @@ def ingest_pathik(root: Path, candidates: list[Candidate], audit: Audit) -> None
                             source_split=original_split,
                             boxes=boxes,
                             image_hash=image_hash,
+                            visual_hash=visual_hash,
                             image_format=image_format,
                             width=width,
                             height=height,
@@ -406,25 +616,26 @@ def ingest_pathik(root: Path, candidates: list[Candidate], audit: Audit) -> None
         progress.close()
 
 
-def cap_kaggle2_negatives(
-    candidates: list[Candidate], fraction: float, audit: Audit
+def filter_detection_candidates(
+    candidates: list[Candidate], min_box_pixels: float, audit: Audit
 ) -> list[Candidate]:
-    keep_ids: set[int] = set()
-    grouped: dict[str, list[tuple[int, Candidate]]] = defaultdict(list)
-    for index, candidate in enumerate(candidates):
-        if candidate.source == "kaggle2":
-            grouped[candidate.source_split or "train"].append((index, candidate))
-        else:
-            keep_ids.add(index)
-    for records in grouped.values():
-        positives = [(index, item) for index, item in records if item.boxes]
-        negatives = [(index, item) for index, item in records if not item.boxes]
-        max_negatives = math.floor(len(positives) * fraction / (1.0 - fraction))
-        negatives.sort(key=lambda pair: pair[1].image_hash)
-        keep_ids.update(index for index, _ in positives)
-        keep_ids.update(index for index, _ in negatives[:max_negatives])
-        audit.skipped["kaggle2:negative_cap"] += max(0, len(negatives) - max_negatives)
-    return [candidate for index, candidate in enumerate(candidates) if index in keep_ids]
+    retained = []
+    for candidate in candidates:
+        if not candidate.boxes:
+            audit.skipped[f"{candidate.source}:no_drone_boxes"] += 1
+            continue
+        undersized = [
+            box
+            for box in candidate.boxes
+            if box[2] * candidate.width < min_box_pixels
+            or box[3] * candidate.height < min_box_pixels
+        ]
+        if undersized:
+            audit.skipped[f"{candidate.source}:undersized_box_image"] += 1
+            audit.removed_objects[f"{candidate.source}:undersized_box"] += len(undersized)
+            continue
+        retained.append(candidate)
+    return retained
 
 
 def deduplicate(candidates: list[Candidate], audit: Audit) -> list[Candidate]:
@@ -446,6 +657,90 @@ def deduplicate(candidates: list[Candidate], audit: Audit) -> list[Candidate]:
         for duplicate in records[1:]:
             audit.duplicates[f"{duplicate.source}->kept:{winner.source}"] += 1
     return selected
+
+
+class HashTree:
+    def __init__(self) -> None:
+        self.root: tuple[int, dict[int, object]] | None = None
+
+    def add(self, value: int) -> None:
+        if self.root is None:
+            self.root = (value, {})
+            return
+        node = self.root
+        while True:
+            current, children = node
+            distance = (value ^ current).bit_count()
+            child = children.get(distance)
+            if child is None:
+                children[distance] = (value, {})
+                return
+            node = child  # type: ignore[assignment]
+
+    def query(self, value: int, threshold: int) -> list[tuple[int, int]]:
+        if self.root is None:
+            return []
+        matches = []
+        pending = [self.root]
+        while pending:
+            current, children = pending.pop()
+            distance = (value ^ current).bit_count()
+            if distance <= threshold:
+                matches.append((distance, current))
+            lower, upper = distance - threshold, distance + threshold
+            pending.extend(child for edge, child in children.items() if lower <= edge <= upper)
+        return matches
+
+
+def find_near_duplicates(
+    candidates: list[Candidate], threshold: int, audit: Audit
+) -> list[dict[str, object]]:
+    tree = HashTree()
+    by_visual_hash: dict[int, list[Candidate]] = defaultdict(list)
+    rows = []
+    for candidate in sorted(candidates, key=lambda item: (item.source, item.image_hash)):
+        value = int(candidate.visual_hash, 16)
+        matches = []
+        for distance, matched_hash in tree.query(value, threshold):
+            for other in by_visual_hash[matched_hash]:
+                if other.source == candidate.source:
+                    continue
+                aspect_a = candidate.width / candidate.height
+                aspect_b = other.width / other.height
+                if abs(aspect_a - aspect_b) / max(aspect_a, aspect_b) > 0.02:
+                    continue
+                matches.append((distance, other))
+        for distance, other in sorted(matches, key=lambda item: item[0])[:3]:
+            key = f"{candidate.source}<->{other.source}"
+            audit.near_duplicates[key] += 1
+            rows.append(
+                {
+                    "hamming_distance": distance,
+                    "source_a": other.source,
+                    "image_a": other.original,
+                    "sha256_a": other.image_hash,
+                    "source_b": candidate.source,
+                    "image_b": candidate.original,
+                    "sha256_b": candidate.image_hash,
+                }
+            )
+        if value not in by_visual_hash:
+            tree.add(value)
+        by_visual_hash[value].append(candidate)
+    return rows
+
+
+def write_near_duplicate_report(output: Path, rows: list[dict[str, object]]) -> None:
+    fields = [
+        "hamming_distance", "source_a", "image_a", "sha256_a",
+        "source_b", "image_b", "sha256_b",
+    ]
+    with (output / "near_duplicate_candidates.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def assign_splits(candidates: list[Candidate]) -> None:
@@ -592,7 +887,7 @@ def write_outputs(candidates: list[Candidate], output: Path, audit: Audit) -> No
     materialize_pathik(candidates, output)
 
     manifest_fields = [
-        "output_image", "split", "source", "original", "sha256", "group", "source_split",
+        "output_image", "split", "source", "original", "sha256", "visual_hash", "group", "source_split",
         "width", "height", "boxes", "negative_kind", "removed_classes",
     ]
     with (output / "manifest.csv").open("w", encoding="utf-8", newline="") as handle:
@@ -610,6 +905,7 @@ def write_outputs(candidates: list[Candidate], output: Path, audit: Audit) -> No
                     "source": candidate.source,
                     "original": candidate.original,
                     "sha256": candidate.image_hash,
+                    "visual_hash": candidate.visual_hash,
                     "group": candidate.group,
                     "source_split": candidate.source_split or "",
                     "width": candidate.width,
@@ -649,12 +945,84 @@ def final_validation(candidates: list[Candidate], output: Path) -> dict[str, obj
     }
 
 
+def write_dataset_card(output: Path, summary: dict[str, object], audit: Audit) -> None:
+    images = summary["images"]
+    objects = summary["objects"]
+    negatives = summary["negative_images"]
+    assert isinstance(images, dict) and isinstance(objects, dict) and isinstance(negatives, dict)
+    source_counts = Counter()
+    for key, count in audit.accepted.items():
+        source_counts[key.split(":", 1)[0]] += count
+    source_lines = "\n".join(f"| `{source}` | {count:,} |" for source, count in sorted(source_counts.items()))
+    text = f"""---
+pretty_name: Merged Single-Class Drone Detection Dataset
+task_categories:
+  - object-detection
+tags:
+  - image
+  - object-detection
+  - yolo
+  - drone-detection
+license: other
+viewer: false
+---
+
+# Merged Single-Class Drone Detection Dataset
+
+Cleaned single-class YOLO data. Every retained image has at least one class `0`
+(`drone`) box. Images without a drone box are excluded.
+
+> This dataset combines sources with different or unresolved redistribution
+> terms. Keep the Hub repository private unless every retained source has been
+> cleared for public redistribution.
+
+## Summary
+
+| Split | Images | Objects | Negative images |
+| --- | ---: | ---: | ---: |
+| Train | {images.get('train', 0):,} | {objects.get('train', 0):,} | {negatives.get('train', 0):,} |
+| Validation | {images.get('val', 0):,} | {objects.get('val', 0):,} | {negatives.get('val', 0):,} |
+| Test | {images.get('test', 0):,} | {objects.get('test', 0):,} | {negatives.get('test', 0):,} |
+| **Total** | **{summary['total_images']:,}** | **{summary['total_objects']:,}** | **{sum(negatives.values()):,}** |
+
+| Source | Retained images |
+| --- | ---: |
+{source_lines}
+
+## Layout
+
+`dataset.yaml` is directly usable by Ultralytics. Images and matching labels
+are under `images/<split>/<hash-prefix>/` and `labels/<split>/<hash-prefix>/`.
+`manifest.csv` records provenance and hashes, while `audit.json` records all
+repairs, exclusions, exact duplicates, and counts.
+
+Exact duplicates are removed using SHA-256. `near_duplicate_candidates.csv`
+lists high-confidence cross-source perceptual-hash matches for manual review;
+these are not automatically removed because adjacent video frames can be
+legitimate distinct training samples. Images without a drone box are excluded,
+as are images containing a box smaller than the configured native-pixel limit.
+
+`annotation_preview.jpg` is a quick contact sheet. For interactive review run:
+
+```bash
+python scripts/view_yolo_dataset.py --dataset datasets/drone_merged
+```
+
+MIDGARD pixel boxes and GEM Label Studio video boxes are converted to normalized
+YOLO coordinates. GEM interpolation is gated by its manually exported
+`drone_exist` value. Sources without usable bounding boxes are excluded.
+"""
+    (output / "README.md").write_text(text, encoding="utf-8")
+
+
 def main() -> int:
     args = parse_args()
     if args.antiuav_stride < 1:
         raise SystemExit("--antiuav-stride must be at least 1")
-    if not 0 <= args.kaggle2_negative_fraction < 1:
-        raise SystemExit("--kaggle2-negative-fraction must be in [0, 1)")
+    if not 0 <= args.near_duplicate_distance <= 512:
+        raise SystemExit("--near-duplicate-distance must be in [0, 512]")
+    if args.min_box_pixels < 1:
+        raise SystemExit("--min-box-pixels must be at least 1")
     if not args.datasets_root.is_dir():
         raise SystemExit(f"datasets root not found: {args.datasets_root}")
     if args.output.exists():
@@ -681,14 +1049,21 @@ def main() -> int:
         audit,
     )
     ingest_rigoleto(args.datasets_root, candidates, audit)
+    ingest_midgard(args.datasets_root, candidates, audit)
+    ingest_gem(args.datasets_root, candidates, audit)
+    ingest_gem_new(args.datasets_root, candidates, audit)
     ingest_pathik(args.datasets_root, candidates, audit)
 
     audit.skipped["drone_bird:incomplete_download"] = 1
     audit.skipped["classification_dataset:no_detection_boxes"] = 1
-    candidates = cap_kaggle2_negatives(candidates, args.kaggle2_negative_fraction, audit)
+    audit.skipped["foggy_img:no_detection_boxes"] = 1
+    audit.skipped["drone_tracking:point_annotations_and_archived_frames"] = 1
+    candidates = filter_detection_candidates(candidates, args.min_box_pixels, audit)
     candidates = deduplicate(candidates, audit)
+    near_duplicates = find_near_duplicates(candidates, args.near_duplicate_distance, audit)
     assign_splits(candidates)
     write_outputs(candidates, args.output, audit)
+    write_near_duplicate_report(args.output, near_duplicates)
     write_preview(args.output)
     summary = final_validation(candidates, args.output)
 
@@ -703,7 +1078,7 @@ def main() -> int:
     report = {
         "parameters": {
             "antiuav_stride": args.antiuav_stride,
-            "kaggle2_negative_fraction": args.kaggle2_negative_fraction,
+            "min_box_pixels": args.min_box_pixels,
         },
         "summary": summary,
         "candidates": dict(sorted(audit.candidates.items())),
@@ -712,10 +1087,12 @@ def main() -> int:
         "removed_objects": dict(sorted(audit.removed_objects.items())),
         "repaired_boxes": dict(sorted(audit.repaired_boxes.items())),
         "duplicates": dict(sorted(audit.duplicates.items())),
+        "near_duplicate_candidates": dict(sorted(audit.near_duplicates.items())),
     }
     with (args.output / "audit.json").open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
         handle.write("\n")
+    write_dataset_card(args.output, summary, audit)
     print(json.dumps(summary, indent=2))
     print(f"Dataset: {args.output / 'dataset.yaml'}")
     print(f"Audit:   {args.output / 'audit.json'}")

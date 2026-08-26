@@ -13,20 +13,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         type=Path,
-        default=Path("datasets/drone_merged"),
-        help="Prepared dataset root.",
+        default=Path("datasets/drone_merged_hf"),
+        help="Packaged dataset root (default: datasets/drone_merged_hf).",
     )
     parser.add_argument(
         "--workers",
         type=int,
-        default=None,
-        help="Concurrent upload workers (Hugging Face default when omitted).",
+        default=2,
+        help="Concurrent upload workers (default: 2).",
     )
     return parser.parse_args()
 
 
 def validate_layout(root: Path) -> None:
-    required = ("README.md", "dataset.yaml", "manifest.csv", "audit.json")
+    required = (
+        "README.md",
+        "dataset.yaml",
+        "manifest.csv",
+        "audit.json",
+        "shard_manifest.json",
+    )
     missing = [name for name in required if not (root / name).is_file()]
     if missing:
         raise SystemExit(f"Dataset is missing required files: {', '.join(missing)}")
@@ -44,7 +50,10 @@ def validate_layout(root: Path) -> None:
 def main() -> None:
     args = parse_args()
     root = args.dataset.resolve()
+    print(f"Validating package: {root}", flush=True)
     validate_layout(root)
+    if args.workers < 1:
+        raise SystemExit("--workers must be at least 1")
 
     try:
         from huggingface_hub import HfApi
@@ -55,6 +64,7 @@ def main() -> None:
         ) from error
 
     api = HfApi()
+    print(f"Checking private dataset repository: {args.repo_id}", flush=True)
     api.create_repo(
         repo_id=args.repo_id,
         repo_type="dataset",
@@ -65,6 +75,11 @@ def main() -> None:
     if not repository.private:
         raise SystemExit(f"Refusing upload because {args.repo_id} is not private")
 
+    print(
+        f"Starting upload with {args.workers} workers. "
+        "Hugging Face will print periodic progress reports.",
+        flush=True,
+    )
     api.upload_large_folder(
         repo_id=args.repo_id,
         repo_type="dataset",
