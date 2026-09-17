@@ -24,7 +24,7 @@ METADATA_FILES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package", type=Path, default=Path("datasets/drone_merged_package"))
+    parser.add_argument("--package", type=Path, default=Path("datasets/drone_merged_hf"))
     parser.add_argument("--output", type=Path, default=Path("datasets/drone_merged"))
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-checksums", action="store_true")

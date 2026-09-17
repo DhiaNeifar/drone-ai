@@ -13,7 +13,7 @@ import cv2
 import yaml
 from tqdm import tqdm
 
-from view_gem_video_annotations import drone_tracks, find_video, interpolate
+from drone_tools.gem_video_annotations import drone_tracks, find_video, interpolate
 
 
 def parse_args() -> argparse.Namespace:

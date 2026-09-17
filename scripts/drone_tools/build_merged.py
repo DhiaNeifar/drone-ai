@@ -33,6 +33,7 @@ FORMAT_EXTENSIONS = {
 }
 SPLITS = ("train", "val", "test")
 SOURCE_PRIORITY = {
+    "recordings": 120,
     "gem_new": 115,
     "gem": 110,
     "midgard": 105,
@@ -553,6 +554,79 @@ def ingest_gem_new(root: Path, candidates: list[Candidate], audit: Audit) -> Non
         )
 
 
+def ingest_annotation_workspaces(root: Path, candidates: list[Candidate], audit: Audit) -> None:
+    """Ingest editor workspaces with frames plus sequence JSON annotations."""
+    bases = []
+    preferred = root / "recordings_clean_annotated"
+    if preferred.is_dir():
+        bases.append(preferred)
+    bases.extend(path for path in sorted(root.glob("*_annotations")) if path.is_dir() and path != preferred)
+    bases.extend(path for path in sorted(root.glob("dataset_samples*")) if path.is_dir())
+
+    for base in bases:
+        sequence_dirs = sorted(path.parent for path in base.rglob("frames") if path.is_dir())
+        for sequence_dir in sequence_dirs:
+            frames_dir = sequence_dir / "frames"
+            json_candidates = [sequence_dir / f"{sequence_dir.name}.json", *sorted(sequence_dir.glob("*.json"))]
+            annotation_path = next((path for path in json_candidates if path.is_file()), None)
+            if annotation_path is None:
+                audit.skipped["recordings:missing_json"] += 1
+                continue
+            try:
+                annotations = json.loads(annotation_path.read_text(encoding="utf-8"))
+                exists = annotations.get("exist")
+                gt_rect = annotations.get("gt_rect")
+                if not isinstance(exists, list) or not isinstance(gt_rect, list):
+                    audit.skipped["recordings:invalid_json"] += 1
+                    continue
+                frame_paths = sorted(
+                    path for path in frames_dir.iterdir() if path.suffix.lower() in IMAGE_EXTENSIONS
+                )
+                if len(frame_paths) != len(exists) or len(frame_paths) != len(gt_rect):
+                    audit.skipped["recordings:length_mismatch"] += 1
+                    continue
+                for frame_index, image_path in enumerate(tqdm(frame_paths, desc=f"Recordings {sequence_dir.name}", unit="image")):
+                    image_hash, image_format, width, height, visual_hash = image_info(image_path)
+                    boxes = []
+                    if bool(exists[frame_index]):
+                        box = gt_rect[frame_index]
+                        if not isinstance(box, list) or len(box) != 4:
+                            audit.skipped["recordings:positive_without_box"] += 1
+                            continue
+                        x, y, box_width, box_height = map(float, box)
+                        raw = (
+                            (x + box_width / 2) / width,
+                            (y + box_height / 2) / height,
+                            box_width / width,
+                            box_height / height,
+                        )
+                        clipped, repaired = clip_yolo_box(raw, width, height)
+                        audit.repaired_boxes["recordings"] += int(repaired)
+                        if clipped is None:
+                            audit.skipped["recordings:malformed_box"] += 1
+                            continue
+                        boxes.append(clipped)
+                    candidates.append(
+                        Candidate(
+                            source="recordings",
+                            original=str(image_path),
+                            group=f"recordings:{sequence_dir.relative_to(base)}",
+                            source_split=None,
+                            boxes=boxes,
+                            image_hash=image_hash,
+                            visual_hash=visual_hash,
+                            image_format=image_format,
+                            width=width,
+                            height=height,
+                            image_path=image_path,
+                            negative_kind="native_empty" if not boxes else "",
+                        )
+                    )
+                    audit.candidates["recordings"] += 1
+            except (OSError, UnidentifiedImageError, ValueError, json.JSONDecodeError):
+                audit.skipped["recordings:invalid_record"] += 1
+
+
 def ingest_pathik(root: Path, candidates: list[Candidate], audit: Audit) -> None:
     base = root / "pathikg-drone-detection-dataset" / "data"
     files = sorted(base.glob("*.parquet"))
@@ -1002,10 +1076,11 @@ these are not automatically removed because adjacent video frames can be
 legitimate distinct training samples. Images without a drone box are excluded,
 as are images containing a box smaller than the configured native-pixel limit.
 
-`annotation_preview.jpg` is a quick contact sheet. For interactive review run:
+`annotation_preview.jpg` is a quick contact sheet. For interactive review,
+open the dataset with the native annotation editor:
 
 ```bash
-python scripts/view_yolo_dataset.py --dataset datasets/drone_merged
+build/annotation_editor/drone_annotation_editor datasets/drone_merged --format yolo
 ```
 
 MIDGARD pixel boxes and GEM Label Studio video boxes are converted to normalized
@@ -1052,6 +1127,7 @@ def main() -> int:
     ingest_midgard(args.datasets_root, candidates, audit)
     ingest_gem(args.datasets_root, candidates, audit)
     ingest_gem_new(args.datasets_root, candidates, audit)
+    ingest_annotation_workspaces(args.datasets_root, candidates, audit)
     ingest_pathik(args.datasets_root, candidates, audit)
 
     audit.skipped["drone_bird:incomplete_download"] = 1
