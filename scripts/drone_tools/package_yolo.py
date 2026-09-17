@@ -76,8 +76,8 @@ The TAR members preserve the original `images/<split>/...` and
 `labels/<split>/...` paths. Download and extract them with the repository tool:
 
 ```bash
-python scripts/extract_yolo_dataset_package.py \\
-  --package datasets/drone_merged_package \\
+python scripts/drone_data.py extract-package \\
+  --package datasets/drone_merged_hf \\
   --output datasets/drone_merged \\
   --overwrite
 ```
