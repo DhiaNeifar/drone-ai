@@ -8,6 +8,25 @@ separately in the private Hugging Face dataset repository
 The Git repository contains code only. Follow the quick start below to download
 the dataset and begin training on a new machine.
 
+### Package for Transfer
+
+To avoid downloading tens of thousands of individual files, package a complete
+sharded YOLO dataset into a small number of TAR files before uploading it:
+
+```bash
+python scripts/drone_data.py package-yolo \
+  --dataset datasets/drone_dataset \
+  --output datasets/drone_dataset_hf \
+  --shard-size-gb 1 \
+  --overwrite
+```
+
+The packager can generate `manifest.csv` from an already-sharded
+`images/<split>` and `labels/<split>` tree. It verifies every image has a label
+and writes checksums to `shard_manifest.json`. Upload only the resulting
+package directory, including `shards/*.tar`, then download those TAR files on
+the server and extract them with `extract-package`.
+
 ## Annotation Toolkit
 
 Detection annotations must remain separate from image pixels. A box rendered

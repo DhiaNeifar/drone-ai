@@ -51,6 +51,37 @@ def label_path(root: Path, image_path: Path) -> Path:
     return (root / "labels" / relative).with_suffix(".txt")
 
 
+def load_manifest(root: Path, output: Path) -> list[dict[str, str]]:
+    manifest_path = root / "manifest.csv"
+    if manifest_path.is_file():
+        with manifest_path.open(encoding="utf-8", newline="") as handle:
+            return list(csv.DictReader(handle))
+
+    rows: list[dict[str, str]] = []
+    for split in ("train", "val", "test"):
+        image_root = root / "images" / split
+        for image in sorted(path for path in image_root.rglob("*") if path.is_file()):
+            label = label_path(root, image)
+            if not label.is_file():
+                raise RuntimeError(f"missing label for image: {image}")
+            boxes = sum(1 for line in label.read_text(encoding="utf-8").splitlines() if line.strip())
+            rows.append(
+                {
+                    "split": split,
+                    "output_image": str(image.relative_to(root)),
+                    "boxes": str(boxes),
+                }
+            )
+
+    if not rows:
+        raise SystemExit(f"no images found under {root / 'images'}")
+    with (output / "manifest.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("split", "output_image", "boxes"))
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows
+
+
 def write_hub_readme(output: Path, audit: dict, shard_count: int) -> None:
     summary = audit["summary"]
     text = f"""---
@@ -99,7 +130,7 @@ def main() -> int:
     output = args.output.resolve()
     if args.shard_size_gb <= 0:
         raise SystemExit("--shard-size-gb must be positive")
-    for name in ("dataset.yaml", "manifest.csv", "audit.json", "README.md"):
+    for name in ("dataset.yaml", "audit.json", "README.md"):
         if not (root / name).is_file():
             raise SystemExit(f"missing required dataset file: {root / name}")
     if output.exists():
@@ -115,8 +146,7 @@ def main() -> int:
             shutil.copy2(source, output / name)
     shutil.copy2(root / "README.md", output / "dataset_card.md")
 
-    with (root / "manifest.csv").open(encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+    rows = load_manifest(root, output)
     by_split: dict[str, list[dict[str, str]]] = {split: [] for split in ("train", "val", "test")}
     for row in rows:
         by_split[row["split"]].append(row)
