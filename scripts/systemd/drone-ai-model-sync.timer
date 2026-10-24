@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically upload finished drone-ai models to Google Drive
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

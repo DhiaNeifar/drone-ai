@@ -222,8 +222,10 @@ __marimo__/
 datasets/
 outputs/
 artifacts/
-real-scenario/
+runs/
+logs/
 
 
 .DS_Store
 .idea
+weights/

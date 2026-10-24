@@ -1,0 +1,8 @@
+[Unit]
+Description=Upload finished drone-ai models to Google Drive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@REPO_ROOT@/scripts/sync_models_to_drive.sh

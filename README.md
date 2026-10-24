@@ -14,7 +14,7 @@ To avoid downloading tens of thousands of individual files, package a complete
 sharded YOLO dataset into a small number of TAR files before uploading it:
 
 ```bash
-python scripts/drone_data.py package-yolo \
+python -m drone_ai.data package-yolo \
   --dataset datasets/drone_dataset \
   --output datasets/drone_dataset_hf \
   --shard-size-gb 1 \
@@ -53,7 +53,7 @@ Run it with:
 
 ```bash
 conda activate drone-yolo
-python scripts/drone_data.py extract-frames /data/Recordings --workers 4
+python -m drone_ai.data extract-frames /data/Recordings --workers 4
 ```
 
 The default JPEG quality is 95. The extractor refuses to replace an existing
@@ -126,7 +126,7 @@ You can also open a YOLO dataset directly:
 
 ```bash
 build/annotation_editor/drone_annotation_editor \
-  datasets/drone_merged \
+  datasets/drone_dataset \
   --format yolo
 ```
 
@@ -138,17 +138,93 @@ and YOLO review/editing.
 The repository intentionally keeps the public command surface small:
 
 ```text
-annotation_editor/          Native image/box editor
-scripts/drone_data.py       Dataset extraction, conversion, validation, package, upload
-scripts/drone_experiment.py Training and inference
-scripts/drone_tools/        Implementation modules behind drone_data.py
-runs/                       Timestamped training runs and checkpoints
-artifacts/                  Timestamped test/inference outputs
-datasets/                   Local raw, working, clean, and packaged datasets
+drone_ai/data/      python -m drone_ai.data  <command>   Fetch, extract, clean, validate, package, upload
+drone_ai/train/     python -m drone_ai.train <model>     Training (yolo, rfdetr, dfine, rtdetr, mark-done)
+drone_ai/test/      python -m drone_ai.test  <command>   Evaluation and inference (yolo-eval, yolo-predict)
+external/           Third-party model repositories as git submodules (ultralytics, RT-DETR, D-FINE, trackers, ...)
+annotation_editor/  Native image/box editor
+weights/            Pretrained base checkpoints
+runs/               Timestamped training runs and checkpoints
+artifacts/          Timestamped test/inference outputs
+datasets/           Local incoming, working, clean, and packaged datasets
+logs/               One log file per command run plus logs/history.jsonl
+scripts/            Drive upload of finished models (systemd timer)
+docs/               Setup guides
 ```
 
-Do not create ad hoc output roots such as `outputs/` or `real-scenario/`.
-Training belongs in `runs/`; testing and inference belong in `artifacts/`.
+Run every command from the repository root. Do not create ad hoc output roots
+such as `outputs/` or `real-scenario/`. Training belongs in `runs/`; testing
+and inference belong in `artifacts/`.
+
+YOLO comes from the pinned `external/ultralytics` submodule, installed in
+editable mode, so the exact Ultralytics version is recorded in Git.
+
+## Logs
+
+Every `python -m drone_ai.<group> <command>` run writes a full DEBUG log to
+`logs/<timestamp>_<group>-<command>.log`, including printed output and the
+traceback of any crash, and appends one line to `logs/history.jsonl` with the
+status (`ok`, `failed`, `interrupted`), duration, arguments, and log path.
+To see recent failures:
+
+```bash
+grep -v '"status": "ok"' logs/history.jsonl | tail
+```
+
+## Incoming Annotations from Google Drive
+
+The annotation team uploads `.zip`/`.rar` archives to a shared Google Drive
+folder. Two commands bring them in:
+
+```bash
+python -m drone_ai.data fetch-drive --folder "<drive folder link>"   # link needed on the first run only
+python -m drone_ai.data extract-archives
+python -m drone_ai.data ingest-incoming --dry-run                    # review what would be added
+python -m drone_ai.data ingest-incoming
+python -m drone_ai.data validate-yolo datasets/drone_dataset
+python -m drone_ai.data package-append                               # new shards only; old shards untouched
+python -m drone_ai.data upload-hf DhiaNeifar/Akkurad_Drone_Detection --tag vYYYY.MM.DD
+python -m drone_ai.data incoming-status                              # summary and failures
+```
+
+`ingest-incoming` reads two annotation formats per sequence folder
+(`<sequence>/frames/` plus one JSON): the annotation editor's
+`exist`/`gt_rect` JSON and Label Studio video exports, whose keyframes are
+interpolated exactly as the annotators' `verif/` renders show them. `verif/`
+folders are never read. Frames without a drone box or with a box under 8 px
+are not added, and exact duplicates of images already in the dataset are
+skipped. New images are tagged `source=drive` in `manifest.csv`, and each
+ingest is recorded under `incoming_ingests` in `audit.json`.
+
+Splits are assigned per recording day, parsed from the sequence name, so
+near-identical footage from one session never appears in both train and test.
+A day already in the dataset keeps its split; each new day goes to the split
+furthest below its 80/10/10 share of all Drive data.
+
+```text
+datasets/incoming/
+|-- ledger.json                 # every Drive file version: id, md5, status, event history
+|-- archives/<drive path>       # downloaded archives, kept permanently
+`-- extracted/<drive path>/     # one clean folder per archive
+```
+
+`fetch-drive` compares the Drive listing with the ledger by file ID and MD5
+and downloads only new or changed files; duplicate uploads and non-archive
+files are recorded and skipped, failed downloads are retried on the next run,
+and every download is MD5-verified. `extract-archives` refuses unsafe paths,
+symlinks, password-protected and corrupt archives, drops OS junk files,
+handles multi-volume RARs, and records a content summary for each archive.
+The Drive link is stored only in the git-ignored ledger.
+
+One-time rclone setup (read-only access to your Google account):
+
+```bash
+rclone config create gdrive drive scope=drive.readonly
+```
+
+On a server without a browser, rclone prints an `rclone authorize ...` command:
+run it on a computer with a browser, then paste the returned token into the
+server prompt.
 
 ## Training Server Quick Start
 
@@ -164,9 +240,11 @@ The server needs:
 Clone the code:
 
 ```bash
-git clone https://github.com/DhiaNeifar/drone-ai.git
+git clone --recurse-submodules https://github.com/DhiaNeifar/drone-ai.git
 cd drone-ai
 ```
+
+For an existing clone, run `git submodule update --init --recursive`.
 
 Create the Python environment:
 
@@ -175,8 +253,8 @@ conda create -n drone-yolo python=3.11 -y
 conda activate drone-yolo
 
 python -m pip install --upgrade pip
+python -m pip install -e external/ultralytics
 python -m pip install \
-  ultralytics \
   huggingface_hub \
   opencv-python-headless \
   pyyaml \
@@ -208,11 +286,11 @@ server, provide the token through the server's secret manager as `HF_TOKEN`.
 
 ### 3. Download the Dataset
 
-The dataset is stored as 17 TAR shards to avoid transferring approximately
-198,000 files individually. Download the shards and metadata:
+The dataset is stored as 27 TAR shards to avoid transferring approximately
+300,000 files individually. Download the shards and metadata:
 
 ```bash
-mkdir -p datasets/drone_merged_hf
+mkdir -p datasets/drone_dataset_hf
 
 hf download DhiaNeifar/Akkurad_Drone_Detection \
   --repo-type dataset \
@@ -224,7 +302,7 @@ hf download DhiaNeifar/Akkurad_Drone_Detection \
   --include "near_duplicate_candidates.csv" \
   --include "annotation_preview.jpg" \
   --include "dataset_card.md" \
-  --local-dir datasets/drone_merged_hf
+  --local-dir datasets/drone_dataset_hf
 ```
 
 The command is resumable. Run the same command again if the SSH connection or
@@ -233,9 +311,9 @@ download is interrupted.
 Extract the package into the YOLO directory expected by the training script:
 
 ```bash
-python scripts/drone_data.py extract-package \
-  --package datasets/drone_merged_hf \
-  --output datasets/drone_merged \
+python -m drone_ai.data extract-package \
+  --package datasets/drone_dataset_hf \
+  --output datasets/drone_dataset \
   --overwrite
 ```
 
@@ -243,16 +321,16 @@ Extraction verifies every shard SHA-256 checksum and checks that image and
 label counts match the package manifest. A successful extraction ends with:
 
 ```text
-YOLO dataset: .../datasets/drone_merged/dataset.yaml
+YOLO dataset: .../datasets/drone_dataset/dataset.yaml
 ```
 
 Confirm the configuration exists:
 
 ```bash
-test -f datasets/drone_merged/dataset.yaml && echo "Dataset ready"
+test -f datasets/drone_dataset/dataset.yaml && echo "Dataset ready"
 ```
 
-After successful extraction, `datasets/drone_merged_hf` is no longer
+After successful extraction, `datasets/drone_dataset_hf` is no longer
 needed for training and may be removed to recover approximately 18 GB.
 
 ### 4. Train
@@ -262,10 +340,10 @@ Start a single-GPU YOLO11 nano training run:
 ```bash
 conda activate drone-yolo
 
-python scripts/drone_experiment.py train \
+python -m drone_ai.train yolo \
   --experiment yolo11n_drone_merged \
-  --model yolo11n.pt \
-  --data datasets/drone_merged/dataset.yaml \
+  --model weights/yolo11n.pt \
+  --data datasets/drone_dataset/dataset.yaml \
   --epochs 60 \
   --imgsz 640 \
   --batch 16 \
@@ -277,7 +355,7 @@ The first run downloads the base YOLO checkpoint if it is not already cached.
 Training output is written under:
 
 ```text
-runs/DD_MM_YYYY_HH_MM_SS_yolo11n_drone_merged/
+runs/YYYY_MM_DD_HH_MM_SS_yolo11n_drone_merged/
 ```
 
 The best checkpoint is `weights/best.pt` inside that run directory. If CUDA
@@ -292,6 +370,13 @@ tmux new -s drone-train
 tmux attach -t drone-train
 ```
 
+### Finished Models on Google Drive
+
+A run that finishes successfully writes `done.json` and is uploaded
+automatically (best and last weights) to the shared
+models Drive folder (one subfolder per run) within five minutes by a systemd timer.
+One-time setup and day-to-day commands: [docs/DRIVE_SYNC.md](docs/DRIVE_SYNC.md).
+
 ## Dataset
 
 The current processed build contains images with at least one valid class `0`
@@ -299,15 +384,15 @@ The current processed build contains images with at least one valid class `0`
 
 | Split | Images | Objects |
 | --- | ---: | ---: |
-| Train | 78,117 | 82,171 |
-| Validation | 12,578 | 12,733 |
-| Test | 8,415 | 8,693 |
-| **Total** | **99,110** | **103,597** |
+| Train | 121,730 | 125,784 |
+| Validation | 16,352 | 16,507 |
+| Test | 12,781 | 13,059 |
+| **Total** | **150,863** | **155,350** |
 
 The extracted YOLO layout is:
 
 ```text
-datasets/drone_merged/
+datasets/drone_dataset/
 |-- images/{train,val,test}/<hash-prefix>/...
 |-- labels/{train,val,test}/<hash-prefix>/...
 |-- dataset.yaml
@@ -335,7 +420,7 @@ cross an image boundary.
 Run the repository validator before packaging, uploading, or training:
 
 ```bash
-python scripts/drone_data.py validate-yolo datasets/drone_merged
+python -m drone_ai.data validate-yolo datasets/drone_dataset
 ```
 
 The command exits nonzero for malformed rows, missing image/label pairs,
@@ -350,7 +435,7 @@ media; this is intentionally optional because it is slower on large datasets.
 Use the native annotation editor for label review. For YOLO data, launch:
 
 ```bash
-build/annotation_editor/drone_annotation_editor datasets/drone_merged --format yolo
+build/annotation_editor/drone_annotation_editor datasets/drone_dataset --format yolo
 ```
 
 ## Update Code or Dataset
@@ -372,13 +457,13 @@ same `--local-dir`, then rerun the extraction command.
 that matters for training is:
 
 ```text
-datasets/drone_merged/
+datasets/drone_dataset/
 ```
 
 That is the cleaned YOLO dataset. The folder that matters for Hugging Face is:
 
 ```text
-datasets/drone_merged_hf/
+datasets/drone_dataset_hf/
 ```
 
 That is the packaged shard set uploaded to the private dataset repository.
@@ -392,7 +477,7 @@ normal flow is:
 3. Put the reviewed workspace under `datasets/` as either
    `recordings_clean_annotated`, any folder ending in `_annotations`, or a
    `dataset_samples*` folder.
-4. Rebuild `datasets/drone_merged` from all approved sources.
+4. Rebuild `datasets/drone_dataset` from all approved sources.
 5. Validate it.
 6. Repackage into TAR shards.
 7. Upload the package to Hugging Face.
@@ -400,17 +485,17 @@ normal flow is:
 For example:
 
 ```bash
-python scripts/drone_data.py extract-frames \
+python -m drone_ai.data extract-frames \
   datasets/Recordings \
   --output datasets/recordings_clean_annotated \
   --workers 4
 
 build/annotation_editor/drone_annotation_editor datasets/recordings_clean_annotated
 
-python scripts/drone_data.py build-merged --overwrite
-python scripts/drone_data.py validate-yolo datasets/drone_merged
-python scripts/drone_data.py package-yolo --overwrite
-python scripts/drone_data.py upload-hf DhiaNeifar/Akkurad_Drone_Detection
+python -m drone_ai.data build-merged --overwrite
+python -m drone_ai.data validate-yolo datasets/drone_dataset
+python -m drone_ai.data package-yolo --overwrite
+python -m drone_ai.data upload-hf DhiaNeifar/Akkurad_Drone_Detection
 ```
 
 The current builder creates a clean, deterministic full dataset. It deduplicates
@@ -433,7 +518,7 @@ Convert the Label Studio GEM video export:
 conda activate drone-yolo
 python -m pip install pyarrow opencv-python
 
-python scripts/drone_data.py prepare-gem \
+python -m drone_ai.data prepare-gem \
   --root datasets/gem_new_videos \
   --overwrite
 ```
@@ -442,16 +527,16 @@ Rebuild all supported sources, remove exact duplicates, apply annotation
 filters, and regenerate the manifest and audit:
 
 ```bash
-python scripts/drone_data.py build-merged --overwrite
+python -m drone_ai.data build-merged --overwrite
 ```
 
 Review the rebuilt dataset before publishing it. Then package it into
 approximately 1 GiB TAR shards:
 
 ```bash
-python scripts/drone_data.py package-yolo \
-  --dataset datasets/drone_merged \
-  --output datasets/drone_merged_hf \
+python -m drone_ai.data package-yolo \
+  --dataset datasets/drone_dataset \
+  --output datasets/drone_dataset_hf \
   --shard-size-gb 1 \
   --overwrite
 ```
@@ -461,9 +546,9 @@ Authenticate and upload the package to the private dataset repository:
 ```bash
 hf auth login
 
-python scripts/drone_data.py upload-hf \
+python -m drone_ai.data upload-hf \
   DhiaNeifar/Akkurad_Drone_Detection \
-  --dataset datasets/drone_merged_hf \
+  --dataset datasets/drone_dataset_hf \
   --workers 2
 ```
 
@@ -475,7 +560,7 @@ upload resumes from its local Hugging Face cache after an interruption.
 Run inference with a trained checkpoint:
 
 ```bash
-python scripts/drone_experiment.py predict \
+python -m drone_ai.test yolo-predict \
   --experiment drone_merged_real_scenario \
   --model runs/<training-run>/weights/best.pt \
   --source /path/to/test/videos \
